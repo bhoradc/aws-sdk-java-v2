@@ -1,0 +1,17 @@
+name: "Maven Dependency Submission"
+on:
+  schedule:
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+jobs:
+  submit-dependencies:
+    if: github.repository == 'bhoradc/aws-sdk-java-v2'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: advanced-security/maven-dependency-submission-action@v5
+        with:
+          maven-args: '-DtransitiveExcludes=*:*'
