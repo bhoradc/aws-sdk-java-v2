@@ -14,4 +14,4 @@ jobs:
       - uses: actions/checkout@v4
       - uses: advanced-security/maven-dependency-submission-action@v5
         with:
-          maven-args: '-DtransitiveExcludes=*:*'
+          maven-args: '-DtransitiveExcludes=*:* -DclasspathScope=runtime'
