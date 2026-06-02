@@ -18,3 +18,75 @@ jobs:
             -DtransitiveExcludes=*:*
             -DclasspathScope=runtime
             -pl !build-tools,!release-scripts,!archetypes,!test/test-utils,!test/sdk-benchmarks,!test/http-client-tests,!test/http-client-benchmarks,!test/s3-benchmarks,!test/protocol-tests-core,!test/ruleset-testing-core,!test/protocol-tests,!test/service-test-utils,!test/codegen-generated-classes-test,!test/sdk-standard-benchmarks,!test/module-path-tests,!test/tests-coverage-reporting,!test/stability-tests,!test/sdk-native-image-test,!test/auth-tests,!test/region-testing,!test/old-client-version-compatibility-test,!test/bundle-logging-bridge-binding-test,!test/v2-migration-tests,!test/bundle-shading-tests,!test/crt-unavailable-tests,!test/architecture-tests,!test/s3-tests
+
+  notify-alerts:
+    needs: submit-dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Wait for alert processing
+        run: sleep 60
+      - name: Check and notify actionable alerts
+        uses: actions/github-script@v8
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.CI_SLACK_WEBHOOK_URL }}
+        with:
+          script: |
+            const now = new Date();
+            const oneDayAgo = new Date(now - 24 * 60 * 60 * 1000).toISOString();
+
+            // Fetch open alerts
+            const alerts = await github.paginate(
+              github.rest.dependabot.listAlertsForRepo,
+              { owner: context.repo.owner, repo: context.repo.repo, state: 'open', per_page: 100 }
+            );
+
+            // Filter: created in last 24h AND fix available
+            const actionable = alerts.filter(a =>
+              a.created_at > oneDayAgo &&
+              a.security_vulnerability.first_patched_version !== null
+            );
+
+            if (actionable.length === 0) {
+              console.log('No new actionable alerts in the last 24 hours.');
+              return;
+            }
+
+            // Group by CVE + package (deduplicate across manifests)
+            const grouped = {};
+            for (const alert of actionable) {
+              const cve = alert.security_advisory.cve_id || alert.security_advisory.ghsa_id;
+              const pkg = alert.security_vulnerability.package.name;
+              const key = `${cve}|${pkg}`;
+              if (!grouped[key]) {
+                grouped[key] = {
+                  cve,
+                  pkg,
+                  severity: alert.security_advisory.severity.toUpperCase(),
+                  fix: alert.security_vulnerability.first_patched_version.identifier,
+                  manifests: [],
+                  url: alert.html_url
+                };
+              }
+              grouped[key].manifests.push(alert.dependency.manifest_path);
+            }
+
+            const entries = Object.values(grouped);
+            console.log(`Found ${entries.length} unique actionable CVE+package combinations.`);
+
+            // Build Slack message
+            const lines = entries.map(e =>
+              `• <${e.url}|${e.cve}> (${e.severity}) — \`${e.pkg}\` → upgrade to \`${e.fix}\` [${e.manifests.length} module(s)]`
+            );
+
+            const message = `🚨 *${entries.length} new Dependabot security alert(s) with fixes available*\n\n${lines.join('\n')}\n\n*Action needed*: Upgrade the affected dependencies.`;
+
+            console.log('Slack message:', message);
+
+            await fetch(process.env.SLACK_WEBHOOK_URL, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ text: message })
+            });
+
+            console.log('Slack notification sent.');
