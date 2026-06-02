@@ -26,70 +26,53 @@ jobs:
     timeout-minutes: 5
     permissions:
       security-events: read
+      contents: read
     steps:
       - name: Wait for alert processing
         run: sleep 60
       - name: Check and notify actionable alerts
-        uses: actions/github-script@v8
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.CI_SLACK_WEBHOOK_URL }}
-        with:
-          script: |
-            const now = new Date();
-            const oneDayAgo = new Date(now - 24 * 60 * 60 * 1000).toISOString();
-
-            // Fetch open alerts
-            const alerts = await github.paginate(
-              github.rest.dependabot.listAlertsForRepo,
-              { owner: context.repo.owner, repo: context.repo.repo, state: 'open', per_page: 100 }
-            );
-
-            // Filter: created in last 24h AND fix available
-            const actionable = alerts.filter(a =>
-              a.created_at > oneDayAgo &&
-              a.security_vulnerability.first_patched_version !== null
-            );
-
-            if (actionable.length === 0) {
-              console.log('No new actionable alerts in the last 24 hours.');
-              return;
-            }
-
-            // Group by CVE + package (deduplicate across manifests)
-            const grouped = {};
-            for (const alert of actionable) {
-              const cve = alert.security_advisory.cve_id || alert.security_advisory.ghsa_id;
-              const pkg = alert.security_vulnerability.package.name;
-              const key = `${cve}|${pkg}`;
-              if (!grouped[key]) {
-                grouped[key] = {
-                  cve,
-                  pkg,
-                  severity: alert.security_advisory.severity.toUpperCase(),
-                  fix: alert.security_vulnerability.first_patched_version.identifier,
-                  manifests: [],
-                  url: alert.html_url
-                };
-              }
-              grouped[key].manifests.push(alert.dependency.manifest_path);
-            }
-
-            const entries = Object.values(grouped);
-            console.log(`Found ${entries.length} unique actionable CVE+package combinations.`);
-
-            // Build Slack message
-            const lines = entries.map(e =>
-              `• <${e.url}|${e.cve}> (${e.severity}) — \`${e.pkg}\` → upgrade to \`${e.fix}\` [${e.manifests.length} module(s)]`
-            );
-
-            const message = `🚨 *${entries.length} new Dependabot security alert(s) with fixes available*\n\n${lines.join('\n')}\n\n*Action needed*: Upgrade the affected dependencies.`;
-
-            console.log('Slack message:', message);
-
-            await fetch(process.env.SLACK_WEBHOOK_URL, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ text: message })
-            });
-
-            console.log('Slack notification sent.');
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Fetch open alerts with fix available, created in last 24h
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          ONE_DAY_AGO=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-24H +%Y-%m-%dT%H:%M:%SZ)
+          
+          ALERTS=$(gh api repos/${{ github.repository }}/dependabot/alerts?state=open\&per_page=100 2>&1) || {
+            echo "Failed to fetch alerts: $ALERTS"
+            echo "Trying with curl..."
+            ALERTS=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json"               "https://api.github.com/repos/${{ github.repository }}/dependabot/alerts?state=open&per_page=100")
+          }
+          
+          # Filter and group using jq
+          MESSAGE=$(echo "$ALERTS" | jq -r --arg cutoff "$ONE_DAY_AGO" '
+            [.[] | select(.created_at > $cutoff and .security_vulnerability.first_patched_version != null)] |
+            group_by(.security_advisory.cve_id // .security_advisory.ghsa_id + "|" + .security_vulnerability.package.name) |
+            map({
+              cve: .[0].security_advisory.cve_id // .[0].security_advisory.ghsa_id,
+              pkg: .[0].security_vulnerability.package.name,
+              severity: .[0].security_advisory.severity,
+              fix: .[0].security_vulnerability.first_patched_version.identifier,
+              count: length,
+              url: .[0].html_url
+            }) |
+            if length == 0 then empty
+            else
+              "🚨 *\(length) new Dependabot security alert(s) with fixes available*\n\n" +
+              (map("• <\(.url)|\(.cve)> (\(.severity | ascii_upcase)) — `\(.pkg)` → upgrade to `\(.fix)` [\(.count) module(s)]") | join("\n")) +
+              "\n\n*Action needed*: Upgrade the affected dependencies."
+            end
+          ')
+          
+          if [ -z "$MESSAGE" ]; then
+            echo "No new actionable alerts in the last 24 hours."
+            exit 0
+          fi
+          
+          echo "Sending Slack notification..."
+          echo "$MESSAGE"
+          
+          curl -s -X POST "$SLACK_WEBHOOK_URL"             -H 'Content-Type: application/json'             -d "{\"text\": \"$MESSAGE\"}"
+          
+          echo "Slack notification sent."
