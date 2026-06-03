@@ -41,12 +41,12 @@ jobs:
             exit 1
           fi
 
-          # Write jq filter to a file to avoid shell escaping issues
           cat > /tmp/filter.jq << 'JQ'
           [.[] | select(.created_at > $cutoff and .security_vulnerability.first_patched_version != null)]
           | group_by((.security_advisory.cve_id // .security_advisory.ghsa_id) + "|" + .security_vulnerability.package.name)
           | map({
               cve: (.[0].security_advisory.cve_id // .[0].security_advisory.ghsa_id),
+              ghsa: .[0].security_advisory.ghsa_id,
               pkg: .[0].security_vulnerability.package.name,
               severity: (.[0].security_advisory.severity | ascii_upcase),
               fix: .[0].security_vulnerability.first_patched_version.identifier,
@@ -55,9 +55,10 @@ jobs:
             })
           | if length == 0 then empty
             else
-              "\(length) new Dependabot security alert(s) with fixes available:\n\n" +
-              (map("* \(.cve) (\(.severity)) - \(.pkg) -> upgrade to \(.fix) [\(.count) module(s)]") | join("\n")) +
-              "\n\nAction needed: Upgrade the affected dependencies."
+              ":warning: *\(length) new CVE(s) detected in SDK dependencies with fixes available*\n\n" +
+              (map("  \u2022 <https://github.com/advisories/\(.ghsa)|\(.cve)> (\(.severity)) \u2014 `\(.pkg)` [\(.count) module(s)]") | join("\n")) +
+              "\n\n" +
+              (map("*Action needed*: Upgrade `\(.pkg)` to `\(.fix)` to address \(.cve)") | join("\n"))
             end
           JQ
 
