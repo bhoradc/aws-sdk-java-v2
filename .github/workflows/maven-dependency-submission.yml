@@ -31,35 +31,37 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.CI_SLACK_WEBHOOK_URL }}
           GH_TOKEN: ${{ secrets.DEPENDABOT_ALERTS_TOKEN }}
+        shell: bash
         run: |
           ONE_DAY_AGO=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-24H +%Y-%m-%dT%H:%M:%SZ)
 
-          # Fetch open alerts using the PAT
-          ALERTS=$(gh api repos/${{ github.repository }}/dependabot/alerts?state=open\&per_page=100 2>&1)
+          ALERTS=$(gh api repos/${{ github.repository }}/dependabot/alerts?state=open\&per_page=100)
           if [ $? -ne 0 ]; then
-            echo "Failed to fetch alerts: $ALERTS"
+            echo "Failed to fetch alerts"
             exit 1
           fi
 
-          # Filter and format
-          MESSAGE=$(echo "$ALERTS" | jq -r --arg cutoff "$ONE_DAY_AGO" '
-            [.[] | select(.created_at > $cutoff and .security_vulnerability.first_patched_version != null)]
-            | group_by((.security_advisory.cve_id // .security_advisory.ghsa_id) + "|" + .security_vulnerability.package.name)
-            | map({
-                cve: .[0].security_advisory.cve_id // .[0].security_advisory.ghsa_id,
-                pkg: .[0].security_vulnerability.package.name,
-                severity: (.[0].security_advisory.severity | ascii_upcase),
-                fix: .[0].security_vulnerability.first_patched_version.identifier,
-                count: length,
-                url: .[0].html_url
-              })
-            | if length == 0 then empty
-              else
-                "\(length) new Dependabot security alert(s) with fixes available:\n\n" +
-                (map("• \(.cve) (\(.severity)) - \(.pkg) -> upgrade to \(.fix) [\(.count) module(s)]") | join("\n")) +
-                "\n\nAction needed: Upgrade the affected dependencies."
-              end
-          ')
+          # Write jq filter to a file to avoid shell escaping issues
+          cat > /tmp/filter.jq << 'JQ'
+          [.[] | select(.created_at > $cutoff and .security_vulnerability.first_patched_version != null)]
+          | group_by((.security_advisory.cve_id // .security_advisory.ghsa_id) + "|" + .security_vulnerability.package.name)
+          | map({
+              cve: (.[0].security_advisory.cve_id // .[0].security_advisory.ghsa_id),
+              pkg: .[0].security_vulnerability.package.name,
+              severity: (.[0].security_advisory.severity | ascii_upcase),
+              fix: .[0].security_vulnerability.first_patched_version.identifier,
+              count: length,
+              url: .[0].html_url
+            })
+          | if length == 0 then empty
+            else
+              "\(length) new Dependabot security alert(s) with fixes available:\n\n" +
+              (map("* \(.cve) (\(.severity)) - \(.pkg) -> upgrade to \(.fix) [\(.count) module(s)]") | join("\n")) +
+              "\n\nAction needed: Upgrade the affected dependencies."
+            end
+          JQ
+
+          MESSAGE=$(echo "$ALERTS" | jq -r --arg cutoff "$ONE_DAY_AGO" -f /tmp/filter.jq)
 
           if [ -z "$MESSAGE" ]; then
             echo "No new actionable alerts in the last 24 hours."
@@ -69,9 +71,10 @@ jobs:
           echo "Sending Slack notification..."
           echo "$MESSAGE"
 
-          # Escape for JSON
-          ESCAPED=$(echo "$MESSAGE" | jq -Rs .)
+          PAYLOAD=$(jq -n --arg text "$MESSAGE" '{text: $text}')
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "$PAYLOAD"
 
-          curl -s -X POST "$SLACK_WEBHOOK_URL"             -H 'Content-Type: application/json'             -d "{\"text\": $ESCAPED}"
-
+          echo ""
           echo "Slack notification sent."
